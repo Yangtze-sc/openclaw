@@ -26,6 +26,7 @@ import {
   installEmbeddedRunnerBaseE2eMocks,
   installEmbeddedRunnerFastRunE2eMocks,
 } from "./test-helpers/embedded-agent-runner-e2e-mocks.js";
+import { createSenseNovaFaultTransport } from "./test-helpers/sensenova-fault-transport.js";
 
 type ProviderFault =
   | { status: 200; text: string }
@@ -640,47 +641,107 @@ describe("runEmbeddedAgent provider fault sequences", () => {
         "sensenova/deepseek-v4-flash",
       );
       const observations: AttemptObservation[] = [];
-      installFaultScript(
-        [
-          ...Array.from({ length: 10 }, () => ({
-            status: 429 as const,
-            window: "sensenova" as const,
-          })),
-          { status: 200, text: "fallback recovered" },
-        ],
-        observations,
-      );
-
-      const first = expectResult(
-        await runScenario({ agentDir, workspaceDir, config, runId: "sensenova-minute-window" }),
-      );
-      expect(
-        observations.map(({ provider, model, profileId }) => [provider, model, profileId]),
-      ).toEqual([
-        ...Array.from({ length: 10 }, () => ["sensenova", "deepseek-v4-flash", "sensenova:p1"]),
-        ["sensenova", "deepseek-flash", "sensenova:p1"],
-      ]);
-      expect(first.result.payloads?.[0]?.text).toContain("fallback recovered");
-      expect(first.attempts).toMatchObject([
-        { provider: "sensenova", model: "deepseek-v4-flash", reason: "rate_limit" },
-      ]);
-      const stats = (await readUsageStats(agentDir))["sensenova:p1"];
-      expect(stats).toMatchObject({
-        cooldownReason: "rate_limit",
-        cooldownModel: "deepseek-v4-flash",
+      const transport = await createSenseNovaFaultTransport();
+      runEmbeddedAttemptMock.mockImplementation(async (rawParams: unknown) => {
+        const params = rawParams as {
+          provider: string;
+          modelId?: string;
+          authProfileId?: string;
+          sessionId: string;
+        };
+        const modelId = params.modelId ?? "unknown";
+        const assistant = await transport.call(params.provider, modelId);
+        observations.push({
+          provider: params.provider,
+          model: modelId,
+          profileId: params.authProfileId,
+          fault:
+            assistant.stopReason === "error"
+              ? transport.getPhase() === "billing"
+                ? { status: 402 }
+                : { status: 429, window: "sensenova" }
+              : {
+                  status: 200,
+                  text:
+                    transport.getPhase() === "minute-window"
+                      ? "fallback recovered"
+                      : "next turn recovered",
+                },
+        });
+        return {
+          ...makeEmbeddedRunnerAttempt({
+            lastAssistant: assistant,
+            assistantTexts:
+              assistant.stopReason === "stop"
+                ? [
+                    transport.getPhase() === "minute-window"
+                      ? "fallback recovered"
+                      : "next turn recovered",
+                  ]
+                : [],
+          }),
+          sessionIdUsed: params.sessionId,
+        };
       });
-      expect(stats?.disabledUntil).toBeUndefined();
 
-      const recovered: AttemptObservation[] = [];
-      installFaultScript([{ status: 200, text: "next turn recovered" }], recovered);
-      const next = expectResult(
-        await runScenario({ agentDir, workspaceDir, config, runId: "sensenova-next-turn" }),
-      );
-      expect(
-        recovered.map(({ provider, model, profileId }) => [provider, model, profileId]),
-      ).toEqual([["sensenova", "deepseek-v4-flash", "sensenova:p1"]]);
-      expect(next.result.payloads?.[0]?.text).toContain("next turn recovered");
-      expect((await readUsageStats(agentDir))["sensenova:p1"]?.disabledUntil).toBeUndefined();
+      try {
+        const first = expectResult(
+          await runScenario({ agentDir, workspaceDir, config, runId: "sensenova-minute-window" }),
+        );
+        expect(new Set(observations.map(({ profileId }) => profileId))).toEqual(
+          new Set(["sensenova:p1"]),
+        );
+        expect(first.result.payloads?.[0]?.text).toContain("fallback recovered");
+        expect(transport.requests.map(({ model, status }) => [model, status])).toEqual([
+          ...Array.from({ length: 10 }, () => ["deepseek-v4-flash", 429]),
+          ["deepseek-flash", 200],
+        ]);
+        expect(transport.transportErrors[0]).toMatchObject({
+          errorCode: "insufficient_quota",
+          errorType: "rate_limit_error",
+        });
+        expect(transport.transportErrors[0]?.errorBody).toContain(
+          "inference exceeds tpm/rpm limit",
+        );
+        expect(first.attempts).toMatchObject([
+          { provider: "sensenova", model: "deepseek-v4-flash", reason: "rate_limit" },
+        ]);
+        const stats = (await readUsageStats(agentDir))["sensenova:p1"];
+        expect(stats).toMatchObject({
+          cooldownReason: "rate_limit",
+          cooldownModel: "deepseek-v4-flash",
+        });
+        expect(stats?.disabledUntil).toBeUndefined();
+
+        transport.setPhase("recovered");
+        const next = expectResult(
+          await runScenario({ agentDir, workspaceDir, config, runId: "sensenova-next-turn" }),
+        );
+        expect(
+          observations
+            .slice(-1)
+            .map(({ provider, model, profileId }) => [provider, model, profileId]),
+        ).toEqual([["sensenova", "deepseek-v4-flash", "sensenova:p1"]]);
+        expect(next.result.payloads?.[0]?.text).toContain("next turn recovered");
+        expect((await readUsageStats(agentDir))["sensenova:p1"]?.disabledUntil).toBeUndefined();
+
+        transport.setPhase("billing");
+        await runScenario({
+          agentDir,
+          workspaceDir,
+          config: makeProviderConfig([], "sensenova/deepseek-v4-flash"),
+          runId: "sensenova-billing-control",
+        });
+        expect(transport.requests.at(-1)).toEqual({ model: "deepseek-v4-flash", status: 402 });
+        expect(transport.transportErrors.at(-1)).toMatchObject({
+          errorCode: "billing_hard_limit_reached",
+        });
+        expect((await readUsageStats(agentDir))["sensenova:p1"]?.disabledUntil).toBeGreaterThan(
+          Date.now(),
+        );
+      } finally {
+        await transport.close();
+      }
     });
   });
 
@@ -1015,3 +1076,4 @@ describe("runEmbeddedAgent provider fault sequences", () => {
     });
   });
 });
+
