@@ -33,6 +33,7 @@ type ProviderFault =
   | { status: 402 }
   | { status: 413 }
   | { status: 429; window: "short" | "long" }
+  | { status: 429; window: "sensenova" }
   // A 429 whose message matches no usage-window keyword and carries the reset only
   // in a Retry-After header of `retryAfterSeconds`, capped by retry.provider
   // .maxRetryDelayMs. This is Anthropic's session-window shape (#148558/#143274).
@@ -111,7 +112,7 @@ beforeEach(() => {
   sleepWithAbortMock.mockClear();
 });
 
-function makeProviderConfig(fallbacks: string[]): OpenClawConfig {
+function makeProviderConfig(fallbacks: string[], primary = "openai/mock-1"): OpenClawConfig {
   const provider = (modelIds: string[]) => ({
     api: "openai-responses" as const,
     apiKey: "test-key",
@@ -128,13 +129,14 @@ function makeProviderConfig(fallbacks: string[]): OpenClawConfig {
   });
   return {
     agents: {
-      defaults: { model: { primary: "openai/mock-1", fallbacks } },
+      defaults: { model: { primary, fallbacks } },
       entries: { test: {} },
     },
     models: {
       providers: {
         openai: provider(["mock-1"]),
         groq: provider(["mock-2", "mock-3"]),
+        sensenova: provider(["deepseek-v4-flash", "deepseek-flash"]),
       },
     },
   };
@@ -167,7 +169,10 @@ async function withScenarioWorkspace<T>(
   }
 }
 
-function writeProfiles(agentDir: string, profiles: { openai: 1 | 2; groq?: boolean }): void {
+function writeProfiles(
+  agentDir: string,
+  profiles: { openai: 1 | 2; groq?: boolean; sensenova?: boolean },
+): void {
   saveAuthProfileStore(
     {
       version: 1,
@@ -179,11 +184,21 @@ function writeProfiles(agentDir: string, profiles: { openai: 1 | 2; groq?: boole
         ...(profiles.groq
           ? { "groq:p1": { type: "api_key" as const, provider: "groq", key: "groq-one" } }
           : {}),
+        ...(profiles.sensenova
+          ? {
+              "sensenova:p1": {
+                type: "api_key" as const,
+                provider: "sensenova",
+                key: "synthetic-test-key",
+              },
+            }
+          : {}),
       },
       usageStats: {
         "openai:p1": { lastUsed: 1 },
         ...(profiles.openai === 2 ? { "openai:p2": { lastUsed: 2 } } : {}),
         ...(profiles.groq ? { "groq:p1": { lastUsed: 3 } } : {}),
+        ...(profiles.sensenova ? { "sensenova:p1": { lastUsed: 4 } } : {}),
       },
     },
     agentDir,
@@ -225,6 +240,23 @@ function makeAttemptForFault(
         // errorBody is the raw provider response body string, which is what the
         // runtime stores; resolveRetryAfterMs parses it back to the same record.
         errorBody: JSON.stringify({ headers: { "retry-after": String(fault.retryAfterSeconds) } }),
+      }),
+    });
+  }
+  if (fault.status === 429 && fault.window === "sensenova") {
+    return makeEmbeddedRunnerAttempt({
+      lastAssistant: buildEmbeddedRunnerAssistant({
+        provider: ref.provider,
+        model: ref.model,
+        stopReason: "error",
+        errorMessage: "429 inference exceeds tpm/rpm limit",
+        errorCode: "insufficient_quota",
+        errorType: "rate_limit_error",
+        errorBody: JSON.stringify({
+          code: "insufficient_quota",
+          message: "inference exceeds tpm/rpm limit",
+          type: "rate_limit_error",
+        }),
       }),
     });
   }
@@ -296,6 +328,11 @@ async function runScenario(params: {
   config: OpenClawConfig;
   runId: string;
 }): Promise<ScenarioOutcome> {
+  const primary = params.config.agents?.defaults?.model;
+  const [primaryProvider = "openai", primaryModel = "mock-1"] =
+    typeof primary === "object" && primary?.primary
+      ? primary.primary.split("/", 2)
+      : ["openai", "mock-1"];
   const { replaceSessionEntry } = await import("../config/sessions/session-accessor.js");
   const sessionTarget = {
     agentId: "test",
@@ -321,8 +358,8 @@ async function runScenario(params: {
     const outcome = await maintenance.run(() =>
       runWithModelFallback<EmbeddedAgentRunResult>({
         cfg: params.config,
-        provider: "openai",
-        model: "mock-1",
+        provider: primaryProvider,
+        model: primaryModel,
         runId: params.runId,
         sessionId: sessionTarget.sessionId,
         sessionKey: sessionTarget.sessionKey,
@@ -592,6 +629,58 @@ describe("runEmbeddedAgent provider fault sequences", () => {
       expect(usageStats["openai:p2"]?.cooldownReason).toMatch(/^auth/);
       expect(usageStats["openai:p2"]?.failureCounts?.auth).toBe(1);
       expect(usageStats["groq:p1"]?.cooldownUntil).toBeUndefined();
+    });
+  });
+
+  it("recovers from the SenseNova minute-window 429 without disabling its profile", async () => {
+    await withScenarioWorkspace(async ({ agentDir, workspaceDir }) => {
+      writeProfiles(agentDir, { openai: 1, sensenova: true });
+      const config = makeProviderConfig(
+        ["sensenova/deepseek-flash"],
+        "sensenova/deepseek-v4-flash",
+      );
+      const observations: AttemptObservation[] = [];
+      installFaultScript(
+        [
+          ...Array.from({ length: 10 }, () => ({
+            status: 429 as const,
+            window: "sensenova" as const,
+          })),
+          { status: 200, text: "fallback recovered" },
+        ],
+        observations,
+      );
+
+      const first = expectResult(
+        await runScenario({ agentDir, workspaceDir, config, runId: "sensenova-minute-window" }),
+      );
+      expect(
+        observations.map(({ provider, model, profileId }) => [provider, model, profileId]),
+      ).toEqual([
+        ...Array.from({ length: 10 }, () => ["sensenova", "deepseek-v4-flash", "sensenova:p1"]),
+        ["sensenova", "deepseek-flash", "sensenova:p1"],
+      ]);
+      expect(first.result.payloads?.[0]?.text).toContain("fallback recovered");
+      expect(first.attempts).toMatchObject([
+        { provider: "sensenova", model: "deepseek-v4-flash", reason: "rate_limit" },
+      ]);
+      const stats = (await readUsageStats(agentDir))["sensenova:p1"];
+      expect(stats).toMatchObject({
+        cooldownReason: "rate_limit",
+        cooldownModel: "deepseek-v4-flash",
+      });
+      expect(stats?.disabledUntil).toBeUndefined();
+
+      const recovered: AttemptObservation[] = [];
+      installFaultScript([{ status: 200, text: "next turn recovered" }], recovered);
+      const next = expectResult(
+        await runScenario({ agentDir, workspaceDir, config, runId: "sensenova-next-turn" }),
+      );
+      expect(
+        recovered.map(({ provider, model, profileId }) => [provider, model, profileId]),
+      ).toEqual([["sensenova", "deepseek-v4-flash", "sensenova:p1"]]);
+      expect(next.result.payloads?.[0]?.text).toContain("next turn recovered");
+      expect((await readUsageStats(agentDir))["sensenova:p1"]?.disabledUntil).toBeUndefined();
     });
   });
 
