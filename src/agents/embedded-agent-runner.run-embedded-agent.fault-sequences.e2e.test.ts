@@ -34,7 +34,6 @@ type ProviderFault =
   | { status: 402 }
   | { status: 413 }
   | { status: 429; window: "short" | "long" }
-  | { status: 429; window: "sensenova" }
   // A 429 whose message matches no usage-window keyword and carries the reset only
   // in a Retry-After header of `retryAfterSeconds`, capped by retry.provider
   // .maxRetryDelayMs. This is Anthropic's session-window shape (#148558/#143274).
@@ -46,7 +45,7 @@ type AttemptObservation = {
   provider: string;
   model: string;
   profileId?: string;
-  fault: ProviderFault;
+  fault: ProviderFault | { status: 429; window: "sensenova" };
 };
 
 type ScenarioOutcome =
@@ -241,23 +240,6 @@ function makeAttemptForFault(
         // errorBody is the raw provider response body string, which is what the
         // runtime stores; resolveRetryAfterMs parses it back to the same record.
         errorBody: JSON.stringify({ headers: { "retry-after": String(fault.retryAfterSeconds) } }),
-      }),
-    });
-  }
-  if (fault.status === 429 && fault.window === "sensenova") {
-    return makeEmbeddedRunnerAttempt({
-      lastAssistant: buildEmbeddedRunnerAssistant({
-        provider: ref.provider,
-        model: ref.model,
-        stopReason: "error",
-        errorMessage: "429 inference exceeds tpm/rpm limit",
-        errorCode: "insufficient_quota",
-        errorType: "rate_limit_error",
-        errorBody: JSON.stringify({
-          code: "insufficient_quota",
-          message: "inference exceeds tpm/rpm limit",
-          type: "rate_limit_error",
-        }),
       }),
     });
   }
@@ -1076,4 +1058,3 @@ describe("runEmbeddedAgent provider fault sequences", () => {
     });
   });
 });
-
