@@ -1,4 +1,3 @@
-Warning: fs was declared with const; use let for reassignable variables.
 // Exercises ordered provider faults through the embedded runner failover boundary.
 import fs from "node:fs/promises";
 import path from "node:path";
